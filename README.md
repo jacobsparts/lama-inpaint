@@ -15,10 +15,6 @@ Two independent backends live in `lama-rs/`:
 | CUDA | `src/cuda.rs` | cuBLAS SGEMM over im2col patches, cuFFT for the Fourier units, custom kernels for the rest; 0.4 s for 512x512 on a GTX 1080 |
 | CPU | `src/cpu.rs` | direct convolution, rayon-parallel; authoritative for semantics - every GPU change is diffed against it (max 1/255, commonly 0) |
 
-`inpaint.py` + `lamacore.py` at the repository root are the original PyTorch
-port that the Rust engines were checked against; they are kept as the reference
-implementation.
-
 ## Quick start (release binary)
 
 Download the binary and the two weight files from the

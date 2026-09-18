@@ -17,3 +17,8 @@ __pycache__/
 
 # Working prototypes and reference dumps
 /attic/
+
+# The original PyTorch port, kept locally as the reference the Rust engine was
+# verified against; not part of the published repository.
+/inpaint.py
+/lamacore.py
