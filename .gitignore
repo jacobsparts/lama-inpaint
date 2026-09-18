@@ -1,0 +1,19 @@
+# Build output
+/lama-rs/target/
+/lama-rs/**/*.rs.bk
+__pycache__/
+*.pyc
+
+# Python environment
+/.venv/
+
+# Model weights and their derived blob (downloaded from the release)
+/big-lama.bin
+/big-lama.json
+/lama-rs/big-lama.bin
+/lama-rs/big-lama.json
+/lama-rs/models/
+/models/
+
+# Working prototypes and reference dumps
+/attic/

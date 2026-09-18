@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The kernel image (src/kernels.fatbin) is checked in, so no CUDA
+      # toolkit is needed to build; nvcc is only required to regenerate it.
+      - name: Build
+        working-directory: lama-rs
+        run: cargo build --release --locked
+
+      - name: Stage the archive
+        run: |
+          mkdir -p dist
+          cp lama-rs/target/release/lama-inpaint dist/
+          cp README.md LICENSE dist/
+          strip dist/lama-inpaint || true
+          tar -C dist -czf lama-inpaint-${{ github.ref_name }}-x86_64-linux.tar.gz .
+          (cd dist && sha256sum lama-inpaint > SHA256SUMS)
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lama-inpaint-${{ github.ref_name }}-x86_64-linux.tar.gz
+            dist/SHA256SUMS
+
+      # The 204 MB weight blob is not stored in the repository (GitHub rejects
+      # pushes above 100 MiB per file), so it is attached to the release
+      # separately:
+      #
+      #   gh release upload "$TAG" big-lama.bin big-lama.json
+      #
+      # or rebuilt from the upstream checkpoint with lama-rs/export_weights.py.

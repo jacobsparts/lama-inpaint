@@ -1,0 +1,28 @@
+[package]
+name = "lama-inpaint"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone big-lama inpainting inference engine (GPU with CPU fallback)"
+
+[[bin]]
+name = "lama-inpaint"
+path = "src/main.rs"
+
+[dependencies]
+png = "0.17"
+rayon = { version = "1", optional = true }
+libc = "0.2"
+
+[features]
+default = ["cpu", "cuda"]
+cpu = ["rayon"]
+# The CUDA backend resolves the driver, cuBLAS and cuFFT through `libc::dlopen`
+# at run time, so the feature carries no dependencies; it exists so that
+# `--no-default-features` can build the CPU engine alone.
+cuda = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
