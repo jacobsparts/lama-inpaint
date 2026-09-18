@@ -1,12 +1,16 @@
 # lama-inpaint
 
-Fast, dependency-light **big-lama** inpainting.
-
+Fast, dependency-light inpainting of objects, damage or watermarks in photos.
 A single self-contained binary runs the LaMa FFC ResNet generator on a GPU
 (or on the CPU), with no Python, no PyTorch and no CUDA toolkit installed.
 The GPU path talks to the driver directly: kernels are precompiled into the
 executable and the driver, cuBLAS and cuFFT are opened at run time with
 `dlopen`. The binary links only `libc`, `libm` and `libgcc_s`.
+
+This is a Linux x86-64 release; the GPU path needs an NVIDIA GPU of compute
+capability 6.1 or newer, while the CPU engine runs anywhere Rust does.
+
+![Demo: original, masked with a black hole, and inpainted result](docs/demo-strip.png)
 
 Two independent backends live in `lama-rs/`:
 
@@ -43,6 +47,10 @@ usage: lama-inpaint --image IN.png --mask MASK.png --output OUT.png
                     [--weights big-lama.bin] [--index big-lama.json]
                     [--cpu | --gpu]
 
+Runs the big-lama FFC ResNet generator over IN.png, inpainting the pixels the
+mask marks (any non-black pixel is a hole), and writes OUT.png at the input
+size.  Use - for either input (but not both) to read a PNG from stdin, or for
+the output to write PNG data to stdout.  Diagnostics always go to stderr.
 GPU is used when available unless --cpu is given.
 ```
 
@@ -50,7 +58,7 @@ GPU is used when available unless --cpu is given.
   searched next to the executable, then in a `models/` subdirectory, then up
   the tree, then the current directory.
 * `--gpu` makes a GPU failure fatal instead of falling back to the CPU engine
-  (~2 minutes for a 512x512 image), and the error names the GPU it found, the
+  (~1 minute for a 512x512 image), and the error names the GPU it found, the
   architectures the binary supports, and how to reach the CPU path.
 
 ## Weights
@@ -117,7 +125,7 @@ it is and which architectures are supported.
 | | time |
 | --- | --- |
 | this binary, GPU | **0.4 s** (0.45 s whole process) |
-| this binary, CPU (`--cpu`) | ~53 s |
+| this binary, CPU (`--cpu`) | ~58 s |
 | PyTorch, warm forward | 0.115 s |
 | PyTorch, whole process | 2.4-3.1 s (1.0 s of it model construction) |
 
