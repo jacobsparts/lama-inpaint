@@ -129,10 +129,10 @@ best with masks of 256x256 or less.
 512x512 window per section, from the edge of the hole inward.  Each pass masks
 only its own section and writes back only its own section, so the rest of the
 hole is context on purpose: passes read the original pixels (the leak this mode
-accepts) and the fills of earlier passes.  Sections do not overlap, so every
-masked pixel is decided by exactly one pass, and the rim of the hole is filled
-before the interior.  The sections are the 256x256 crop the weights were
-trained on.
+accepts) and the fills of earlier passes.  The sections tile the mask's bounding
+box, so every masked pixel is decided by exactly one pass, and the rim of the
+hole is filled before the interior.  The sections are the 256x256 crop the
+weights were trained on.
 Sections and --tile are mutually exclusive.";
 
 /// Where the weight blob lives when `--weights` is not given.
@@ -258,7 +258,9 @@ fn run(args: Args) -> Result<(), String> {
         return run_tiled(&store, &plan, &src, &mask, &args);
     }
 
-    if !args.force_cpu {
+    // Only a forced GPU run is refused: without --gpu a card that cannot hold
+    // the pass falls back to the CPU engine, which is the documented behaviour.
+    if args.force_gpu {
         cuda::check_capacity(
             height + pad_h,
             width + pad_w,
@@ -387,7 +389,9 @@ fn run_tiled(
     let sub_mask = crop_gray(mask, &tile);
     let pad_h = (PAD_MOD - tile.side % PAD_MOD) % PAD_MOD;
     let pad_w = pad_h;
-    if !args.force_cpu {
+    // `--tile` sizes its window from the mask, so a large mask can ask for far
+    // more than the card holds; a forced GPU run is refused before allocating.
+    if args.force_gpu {
         cuda::check_capacity(
             tile.side + pad_h,
             tile.side + pad_w,
@@ -436,11 +440,10 @@ fn run_tiled(
 ///
 /// Two properties make the incremental fill work:
 ///
-/// * Only the pass's own section is written back, and sections do not overlap,
-///   so every masked pixel is decided by exactly one pass - the one that owns
-///   it.  The passes step over the bounding box a whole section at a time, so
-///   the section grid is a partition of the hole rather than a set of
-///   overlapping covers, and a pass boundary stays a boundary.
+/// * Only the pass's own section is written back, and the sections tile the
+///   bounding box a whole block at a time, so every masked pixel is decided by
+///   exactly one pass - the one that owns it - and a pass boundary stays a
+///   boundary.
 /// * Every pass masks only its own section.  The rest of the hole is left
 ///   unmasked on purpose, so the network sees the original content there and has
 ///   something continuous to work from instead of a hard 512-wide hole.  That is
@@ -456,8 +459,8 @@ fn run_sections(
 ) -> Result<(), String> {
     let t_start = Instant::now();
     let (width, height) = (src.width, src.height);
-    // Sections are a plain partition of the mask's bounding box: no overlap and
-    // no stride to choose, so every pixel is decided by exactly one pass.
+    // The sections partition the mask's bounding box, so every pixel is decided
+    // by exactly one pass.
     let sections = section_rects(mask);
     if sections.is_empty() {
         log("--sections: mask is empty; copying the input to the output");
@@ -508,12 +511,6 @@ fn run_sections(
             }
         }
 
-        if !args.force_cpu {
-            // A 512x512 pass needs about 0.6 GB, so this cannot fail on any
-            // device that can run the mode at all; the check is here so the
-            // number is reported rather than discovered on a tiny card.
-            cuda::check_capacity(side + pad, side + pad, "Use the CPU engine (--cpu).")?;
-        }
         let input = build_input(&sub_src, &sub_mask, pad, pad);
         let t0 = Instant::now();
         let out = infer(store, plan, input, side + pad, side + pad, args)?;
@@ -576,9 +573,8 @@ struct Section {
 /// Split the mask into discrete `SECTION_BLOCK`-sized sections, ordered from the
 /// rim of the hole inward.
 ///
-/// Sections tile the mask's bounding box without overlap: every masked pixel
-/// belongs to exactly one section, is written once, and never has its value
-/// re-solved by a later pass.
+/// The sections tile the mask's bounding box: every masked pixel belongs to
+/// exactly one section and is written once.
 ///
 /// The order comes from the mask's own depth - the distance from each masked
 /// pixel to the rim of the hole - taking the shallowest pixel of each section.
@@ -974,13 +970,13 @@ mod tests {
         let m = mask_of(1024, 1024, Some((300, 300, 598, 598)));
         let s = section_rects(&m);
         assert_eq!(s.len(), 4); // two starts across, two down
-        // No overlap: `assert_covers` pins that every masked pixel is covered
-        // exactly once, and the sections must also be pairwise disjoint.
+        // `assert_covers` pins that every masked pixel is covered exactly once;
+        // the sections must also be pairwise disjoint.
         assert_covers(&s, &m);
         for (i, a) in s.iter().enumerate() {
             for b in &s[i + 1..] {
                 let disjoint = a.x1 <= b.x0 || b.x1 <= a.x0 || a.y1 <= b.y0 || b.y1 <= a.y0;
-                assert!(disjoint, "sections {a:?} and {b:?} overlap");
+                assert!(disjoint, "sections {a:?} and {b:?} share a pixel");
             }
         }
         assert_eq!(

@@ -68,10 +68,10 @@ best with masks of 256x256 or less.
 512x512 window per section, from the edge of the hole inward.  Each pass masks
 only its own section and writes back only its own section, so the rest of the
 hole is context on purpose: passes read the original pixels (the leak this mode
-accepts) and the fills of earlier passes.  Sections do not overlap, so every
-masked pixel is decided by exactly one pass, and the rim of the hole is filled
-before the interior.  The sections are the 256x256 crop the weights were
-trained on.
+accepts) and the fills of earlier passes.  The sections tile the mask's bounding
+box, so every masked pixel is decided by exactly one pass, and the rim of the
+hole is filled before the interior.  The sections are the 256x256 crop the
+weights were trained on.
 Sections and --tile are mutually exclusive.
 ```
 
@@ -80,7 +80,8 @@ Sections and --tile are mutually exclusive.
   the tree, then the current directory.
 * `--gpu` makes a GPU failure fatal instead of falling back to the CPU engine
   (~1 minute for a 512x512 image), and the error names the GPU it found, the
-  architectures the binary supports, and how to reach the CPU path.
+  architectures the binary supports, and how to reach the CPU path. A pass the
+  device cannot hold is refused the same way, before anything is allocated.
 * `--tile` runs the network on a square window around the mask instead of the
   whole image. The window is twice the mask's bounding box, at least 512x512,
   centred on the mask and clamped inside the image; images at or below 512px on
@@ -149,14 +150,15 @@ LD_LIBRARY_PATH=/path/to/driver ./lama-inpaint ... --gpu
 ```
 
 If the running GPU has no matching code in the binary, the error says which GPU
-it is and which architectures are supported.
-If the run would not fit in the device's memory, it is refused before anything
-is allocated, with the estimated need, the free and total device memory, and the
-flag to use instead: a `--tile` window is sized from the mask, so a large mask
-can ask for a window far bigger than the card holds (peak use is about 1.1 GiB
-per megapixel of window, so a 3472x3472 window needs ~13 GB). `--sections` caps
-every pass at 512x512, and the plain path needs the whole image, so the hint
-names whichever of those fits better.
+it is and which architectures are supported. Under `--gpu`, a pass the device
+cannot hold is refused before anything is allocated, with the estimated need,
+the free and total device memory, and the flag to use instead: a `--tile` window
+is sized from the mask, so a large mask can ask for a window far bigger than the
+card holds (peak use is about 1.1 GiB per megapixel of window, so a 3472x3472
+window needs ~13 GB). `--sections` caps every pass at 512x512, and the plain
+path needs the whole image, so the hint names whichever of those fits better.
+Without `--gpu` the run is left alone: a card that cannot hold the pass falls
+back to the CPU engine, as it does for any other GPU failure.
 
 ## Performance
 
@@ -229,9 +231,8 @@ the weights were trained for:
 * **Each pass masks only its own piece.** The rest of the hole is left unmasked
   on purpose: the network sees the original content there, which gives it
   something continuous to work from instead of a hard 512-wide hole.
-* Pieces **do not overlap**: they tile the mask's bounding box a whole 256x256
-  block at a time, so every masked pixel is written by exactly one pass and
-  nothing is re-solved.
+* Pieces **tile the mask's bounding box** a whole 256x256 block at a time, so
+  every masked pixel is written by exactly one pass.
 * `--sections` and `--tile` are mutually exclusive. Either flag on an image at or
   below 512px on its short side runs the whole image instead, with a note.
 
@@ -249,12 +250,7 @@ around it, so the piece edges are not visible as seams on this image. On a
 1024x1024 image with a 399x299 solid ellipse the filling behaves as the
 mechanism predicts instead: 79% of the hole's pixels end up more than a quarter
 of the way toward the object's colour, because past ~100px inside the hole every
-pass is handed pieces that are still original object. (Overlapping pieces, which
-this mode used to have, measured 75%: re-solving a boundary with the fill already
-around it recovers a little of the original content, at the cost of more passes.
-It did not make the boundary cleaner - on the same photo the overlapping build
-measured a *larger* step across the piece boundary, 26.4 and 14.8 against the
-20.7 and 12.3 above.)
+pass is handed pieces that are still original object.
 
 **What this means in practice:** `--sections` is for large masks that are thin or
 textured enough that the original content reads as background around each piece.
@@ -282,7 +278,8 @@ Every change is checked against two fixed references:
 `LAMA_PROFILE=1` prints a per-phase breakdown (context setup, weight upload,
 step loop, download, totals). Finer instruments: `LAMA_PROFILE_OPS`,
 `LAMA_PROFILE_SUB`, `LAMA_PROFILE_SYNC`, `LAMA_DUMP_STEP=n`, `LAMA_FFT_HOST`,
-`LAMA_DEBUG_CUFFT`, `LAMA_CONVT_GATHER`, `LAMA_NO_POOL`. Without
+`LAMA_DEBUG_CUFFT`, `LAMA_CONVT_GATHER`, `LAMA_NO_POOL`,
+`LAMA_DUMP_SECTIONS=dir` (snapshot each `--sections` pass as a PNG). Without
 `LAMA_PROFILE_SYNC`, per-step timings measure submission only.
 
 ## Credits and licence
