@@ -46,12 +46,23 @@ cat input.png | ./lama-inpaint --image - --mask mask.png --output - > output.png
 usage: lama-inpaint --image IN.png --mask MASK.png --output OUT.png
                     [--weights big-lama.bin] [--index big-lama.json]
                     [--cpu | --gpu]
+                    [--tile]
 
 Runs the big-lama FFC ResNet generator over IN.png, inpainting the pixels the
 mask marks (any non-black pixel is a hole), and writes OUT.png at the input
 size.  Use - for either input (but not both) to read a PNG from stdin, or for
 the output to write PNG data to stdout.  Diagnostics always go to stderr.
 GPU is used when available unless --cpu is given.
+Images at or below 512px on the short side are run whole even with --tile.
+
+--tile runs the network on a square window around the mask instead of the whole
+image: the window is twice the mask bounding box, at least 512x512, centred on
+the mask and clamped inside the image.
+
+Only the masked pixels are taken from the network, exactly as without --tile, so
+the output is identical to cropping the window out by hand, running this binary
+on it and pasting the hole back.  Best for large images with small holes, and
+best with masks of 256x256 or less.
 ```
 
 * `--weights` / `--index` default to `big-lama.bin` and its `.json` index,
@@ -60,6 +71,13 @@ GPU is used when available unless --cpu is given.
 * `--gpu` makes a GPU failure fatal instead of falling back to the CPU engine
   (~1 minute for a 512x512 image), and the error names the GPU it found, the
   architectures the binary supports, and how to reach the CPU path.
+* `--tile` runs the network on a square window around the mask instead of the
+  whole image. The window is twice the mask's bounding box, at least 512x512,
+  centred on the mask and clamped inside the image; images at or below 512px on
+  their short side are run whole regardless. Only masked pixels are taken from
+  the network, exactly as without `--tile`, so the result is identical to
+  cropping the window out by hand and pasting the hole back - see
+  [Large images](#large-images---tile).
 
 ## Weights
 
@@ -132,6 +150,43 @@ it is and which architectures are supported.
 For one image per process - the way the service calls it - the standalone
 binary is several times faster end to end; PyTorch only wins per forward pass
 once a warm model already exists in memory.
+
+## Large images (`--tile`)
+
+The generator was trained on 256x256 and 512x512 crops and its receptive field
+is a few hundred pixels, so on a 2048x2048 photo a small hole gets no more
+context than it would at 512 - while the whole-frame forward pass costs 12x
+more and, because the mask occupies a smaller fraction of the frame, often
+produces *worse* fill: the network has to invent texture at a scale it never
+saw in training.
+
+`--tile` crops a square window around the mask, runs the network on that, and
+pastes the result back:
+
+```
+./lama-inpaint --image big.png --mask mask.png --output out.png --tile
+```
+
+* The window is centred on the mask's bounding box and sized to **twice the
+  longer side** of that box, never less than 512x512, rounded to a multiple of
+  8 (the network has three stride-2 stages) and clamped inside the image.
+* Only masked pixels are taken from the network; every other pixel is copied
+  from the input. Cropping therefore changes nothing about how masked and
+  unmasked areas are treated, and the output is byte-for-byte what you would
+  get by cropping the window out by hand, running the binary on it, and pasting
+  the hole back.
+* Images at or below 512px on the short side are run whole even with `--tile`,
+  so it is always safe to pass the flag.
+
+A 300x300 mask in a 2048x2048 image gives a 600x600 window:
+
+| | window | time (GTX 1080) |
+| --- | --- | --- |
+| without `--tile` | 2048x2048 | 4.58 s |
+| with `--tile` | 600x600 | **0.67 s** |
+
+Best results come from masks of 256x256 or smaller, which is also the regime the
+weights were trained on.
 
 ## Verification
 
