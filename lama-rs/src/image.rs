@@ -2,7 +2,7 @@
 
 use png::{BitDepth, ColorType, Decoder, Encoder};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 /// An 8-bit RGB image, row-major HWC.
@@ -35,10 +35,9 @@ struct Raw {
     palette: Vec<u8>,
 }
 
-fn decode_raw(path: &Path) -> Result<Raw, String> {
-    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let dec = Decoder::new(file);
-    let mut rdr = dec.read_info().map_err(|e| e.to_string())?;
+fn decode_raw<R: Read>(reader: R, source: &str) -> Result<Raw, String> {
+    let dec = Decoder::new(reader);
+    let mut rdr = dec.read_info().map_err(|e| format!("{source}: {e}"))?;
     let (width, height, color, depth) = {
         let i = rdr.info();
         (i.width as usize, i.height as usize, i.color_type, i.bit_depth)
@@ -76,8 +75,16 @@ impl Raw {
 }
 
 /// Decode a PNG to 8-bit RGB, expanding greyscale / palette / 16-bit as needed.
+///
+/// A path of `-` reads the PNG from standard input.
 pub fn read_rgb(path: &Path) -> Result<Rgb8, String> {
-    let raw = decode_raw(path)?;
+    let raw = if path.as_os_str() == "-" {
+        let stdin = std::io::stdin();
+        decode_raw(stdin.lock(), "stdin")?
+    } else {
+        let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        decode_raw(file, &path.display().to_string())?
+    };
     let mut img = Rgb8::new(raw.width, raw.height);
     let palette_entries = raw.palette.len() / 3;
     for y in 0..raw.height {
@@ -122,15 +129,29 @@ pub fn read_gray(path: &Path) -> Result<Gray8, String> {
     Ok(g)
 }
 
-pub fn write_rgb(path: &Path, img: &Rgb8) -> Result<(), String> {
-    let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut enc = Encoder::new(BufWriter::new(file), img.width as u32, img.height as u32);
+fn encode_rgb<W: Write>(writer: W, img: &Rgb8, destination: &str) -> Result<(), String> {
+    let mut enc = Encoder::new(writer, img.width as u32, img.height as u32);
     enc.set_color(ColorType::Rgb);
     enc.set_depth(BitDepth::Eight);
-    let mut wtr = enc.write_header().map_err(|e| e.to_string())?;
-    wtr.write_image_data(&img.data).map_err(|e| e.to_string())?;
-    wtr.finish().map_err(|e| e.to_string())?;
+    let mut wtr = enc.write_header().map_err(|e| format!("{destination}: {e}"))?;
+    wtr.write_image_data(&img.data).map_err(|e| format!("{destination}: {e}"))?;
+    wtr.finish().map_err(|e| format!("{destination}: {e}"))?;
     Ok(())
+}
+
+/// Encode an RGB image as PNG. A path of `-` writes to standard output.
+pub fn write_rgb(path: &Path, img: &Rgb8) -> Result<(), String> {
+    if path.as_os_str() == "-" {
+        let stdout = std::io::stdout();
+        let mut writer = BufWriter::new(stdout.lock());
+        encode_rgb(&mut writer, img, "stdout")?;
+        writer.flush().map_err(|e| format!("stdout: {e}"))
+    } else {
+        let file = File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        encode_rgb(&mut writer, img, &path.display().to_string())?;
+        writer.flush().map_err(|e| format!("{}: {e}", path.display()))
+    }
 }
 
 /// Map a possibly out-of-range index back inside `[0, n)` by reflection,

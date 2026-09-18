@@ -63,6 +63,13 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
+    let image = image.ok_or("--image is required")?;
+    let mask = mask.ok_or("--mask is required")?;
+    let output = output.ok_or("--output is required")?;
+    if image.as_os_str() == "-" && mask.as_os_str() == "-" {
+        return Err("--image and --mask cannot both be '-' (stdin has only one stream)".to_string());
+    }
+
     let weights = weights.unwrap_or_else(|| default_weights("big-lama.bin"));
     let index = index.unwrap_or_else(|| {
         let mut p = weights.clone();
@@ -70,9 +77,9 @@ fn parse_args() -> Result<Args, String> {
         p
     });
     Ok(Args {
-        image: image.ok_or("--image is required")?,
-        mask: mask.ok_or("--mask is required")?,
-        output: output.ok_or("--output is required")?,
+        image,
+        mask,
+        output,
         weights,
         index,
         force_cpu,
@@ -87,7 +94,9 @@ usage: lama-inpaint --image IN.png --mask MASK.png --output OUT.png
 
 Runs the big-lama FFC ResNet generator over IN.png, inpainting the pixels the
 mask marks (any non-black pixel is a hole), and writes OUT.png at the input
-size.  GPU is used when available unless --cpu is given.";
+size.  Use - for either input (but not both) to read a PNG from stdin, or for
+the output to write PNG data to stdout.  Diagnostics always go to stderr.
+GPU is used when available unless --cpu is given.";
 
 /// Where the weight blob lives when `--weights` is not given.
 ///

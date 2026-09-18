@@ -18,7 +18,7 @@ Two independent backends live in `lama-rs/`:
 ## Quick start (release binary)
 
 Download the binary and the two weight files from the
-[latest release](https://github.com/OWNER/lama-inpaint/releases/latest) into one
+[latest release](https://github.com/jacobsparts/lama-inpaint/releases/latest) into one
 directory and run:
 
 ```
@@ -28,6 +28,15 @@ directory and run:
 The weights are found next to the executable by default, so no paths are
 needed. `--mask` is a PNG in which any non-black pixel marks a hole; the output
 is written at the input size.
+
+Use `-` for either input to read that PNG from standard input. The image and
+mask cannot both be `-`, because standard input is a single stream. Use
+`--output -` to write the result PNG to standard output; progress and
+diagnostics remain on standard error.
+
+```sh
+cat input.png | ./lama-inpaint --image - --mask mask.png --output - > output.png
+```
 
 ```
 usage: lama-inpaint --image IN.png --mask MASK.png --output OUT.png
@@ -70,9 +79,7 @@ kernel image is checked in.
 
 ```
 cd lama-rs
-cargo build --release                                  # both engines
-cargo build --release --no-default-features            # CPU only
-cargo build --release --no-default-features --features cuda
+cargo build --release
 ```
 
 To regenerate the embedded kernel image after editing `src/kernels.cu`

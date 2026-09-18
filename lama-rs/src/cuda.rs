@@ -61,7 +61,7 @@ fn unavailable_reason(code: i32) -> String {
         lines.push("  libcuda.so.1 does not match the loaded kernel module, so cuInit".to_string());
         lines.push("  fails with error 804.  Point LD_LIBRARY_PATH at the userspace".to_string());
         lines.push("  driver matching the module, e.g.".to_string());
-        lines.push("    LD_LIBRARY_PATH=/home/jacob/nvidia-535.216.01".to_string());
+        lines.push("    LD_LIBRARY_PATH=/path/to/your/nvidia/driver/lib".to_string());
     }
     lines.join("\n")
 }
