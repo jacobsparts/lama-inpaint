@@ -1,6 +1,6 @@
 [package]
 name = "lama-inpaint"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Standalone big-lama inpainting inference engine (GPU with CPU fallback)"
 

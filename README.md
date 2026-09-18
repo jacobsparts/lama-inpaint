@@ -64,15 +64,14 @@ the output is identical to cropping the window out by hand, running this binary
 on it and pasting the hole back.  Best for large images with small holes, and
 best with masks of 256x256 or less.
 
---sections fills a mask larger than 256x256 with overlapping 256x256 sections,
-one 512x512 window per section, from the edge of the hole inward.  Each pass
-masks only its own section and writes back only its own section, so the rest of
-the hole is context on purpose: passes read the original pixels (the leak this
-mode accepts) and the earlier fills, and each pixel is re-solved by the last
-pass that covers it.
-Sections start 224px apart, so neighbours overlap by 32px.  More overlap limits
-the leak but smooths structure away; less preserves detail but reproduces more
-of a large object inside its own hole.  224 is the default.
+--sections fills a mask larger than 256x256 in discrete 256x256 sections, one
+512x512 window per section, from the edge of the hole inward.  Each pass masks
+only its own section and writes back only its own section, so the rest of the
+hole is context on purpose: passes read the original pixels (the leak this mode
+accepts) and the fills of earlier passes.  Sections do not overlap, so every
+masked pixel is decided by exactly one pass, and the rim of the hole is filled
+before the interior.  The sections are the 256x256 crop the weights were
+trained on.
 Sections and --tile are mutually exclusive.
 ```
 
@@ -89,10 +88,10 @@ Sections and --tile are mutually exclusive.
   the network, exactly as without `--tile`, so the result is identical to
   cropping the window out by hand and pasting the hole back - see
   [Large images](#large-images---tile).
-* `--sections` fills a mask larger than 256x256 in overlapping 256x256 pieces,
-  one 512x512 window per piece, from the rim of the hole inward, so every pass
-  runs the network at the scale it was trained for. Pieces start 224px apart
-  (32px of overlap); it is a different tradeoff from `--tile`, not a better one -
+* `--sections` fills a mask larger than 256x256 in discrete 256x256 pieces, one
+  512x512 window per piece, from the rim of the hole inward, so every pass runs
+  the network at the scale it was trained for. Every masked pixel is decided by
+  exactly one pass; it is a different tradeoff from `--tile`, not a better one -
   see [Large masks](#large-masks---sections).
 
 ## Weights
@@ -151,6 +150,13 @@ LD_LIBRARY_PATH=/path/to/driver ./lama-inpaint ... --gpu
 
 If the running GPU has no matching code in the binary, the error says which GPU
 it is and which architectures are supported.
+If the run would not fit in the device's memory, it is refused before anything
+is allocated, with the estimated need, the free and total device memory, and the
+flag to use instead: a `--tile` window is sized from the mask, so a large mask
+can ask for a window far bigger than the card holds (peak use is about 1.1 GiB
+per megapixel of window, so a 3472x3472 window needs ~13 GB). `--sections` caps
+every pass at 512x512, and the plain path needs the whole image, so the hint
+names whichever of those fits better.
 
 ## Performance
 
@@ -209,9 +215,9 @@ weights were trained on.
 `--tile` does not help when the hole itself is large - the window is then the
 whole image again. A mask well beyond 256x256 is also outside the regime the
 weights were trained on, and a single pass over a big hole invents texture at a
-scale the network never saw. `--sections` fills such a mask in overlapping
-256x256 pieces, one 512x512 window per piece, so every forward pass sees a hole
-the size the weights were trained for:
+scale the network never saw. `--sections` fills such a mask in discrete 256x256
+pieces, one 512x512 window per piece, so every forward pass sees a hole the size
+the weights were trained for:
 
 ```
 ./lama-inpaint --image big.png --mask bigmask.png --output out.png --sections
@@ -223,26 +229,32 @@ the size the weights were trained for:
 * **Each pass masks only its own piece.** The rest of the hole is left unmasked
   on purpose: the network sees the original content there, which gives it
   something continuous to work from instead of a hard 512-wide hole.
-* Pieces start 224px apart, so neighbours overlap by 32px and a pixel near a
-  boundary is re-solved by a later pass, by which time it has fill around it.
+* Pieces **do not overlap**: they tile the mask's bounding box a whole 256x256
+  block at a time, so every masked pixel is written by exactly one pass and
+  nothing is re-solved.
 * `--sections` and `--tile` are mutually exclusive. Either flag on an image at or
   below 512px on its short side runs the whole image instead, with a note.
 
-The overlap is a dial between two failure modes, and it is not a quality knob
-that goes up:
+Measured on a 1000x667 photo (350x270 mask across a boardwalk), with the four
+piece boundaries set by the mask's bounding box:
 
-| | less overlap | more overlap |
+| | discontinuity across a piece boundary | interior control |
 | --- | --- | --- |
-| cost | fewer passes | more passes, more redundant work |
-| structure | preserved (passes see fresh content) | smoothed away - each pass re-solves over already-smoothed fill |
-| leak | worse | better - more pixels re-solved with fill around them |
+| `--sections` | 20.7 / 12.3 | 18.2 / 15.1 |
 
-Measured on a 1000x667 photo (350x270 mask across a boardwalk): the coarsest
-strides keep both rails and the deck texture, while half-section overlap (128)
-loses a rail and the finest strides smooth the deck into a repeating ramp. On a
-1024x1024 image with a 399x299 solid ellipse, the leak is the dominant effect
-instead: the fill converges to the object colour at depth, because past ~100px
-inside the hole every pass is handed pieces that are still original object.
+The two figures are the mean absolute step across the vertical and horizontal
+boundaries, over masked pixels either side; the controls are the same measure
+across an interior line 64px away. Neither boundary stands out against the fill
+around it, so the piece edges are not visible as seams on this image. On a
+1024x1024 image with a 399x299 solid ellipse the filling behaves as the
+mechanism predicts instead: 79% of the hole's pixels end up more than a quarter
+of the way toward the object's colour, because past ~100px inside the hole every
+pass is handed pieces that are still original object. (Overlapping pieces, which
+this mode used to have, measured 75%: re-solving a boundary with the fill already
+around it recovers a little of the original content, at the cost of more passes.
+It did not make the boundary cleaner - on the same photo the overlapping build
+measured a *larger* step across the piece boundary, 26.4 and 14.8 against the
+20.7 and 12.3 above.)
 
 **What this means in practice:** `--sections` is for large masks that are thin or
 textured enough that the original content reads as background around each piece.
