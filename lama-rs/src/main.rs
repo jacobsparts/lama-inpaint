@@ -15,6 +15,7 @@ mod image;
 mod model;
 mod weights;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,6 +36,9 @@ struct Args {
     /// Crop a tile around the mask and run the network on that instead of the
     /// whole image (`--tile`).
     tile: bool,
+    /// Section a large mask into overlapping 256x256 pieces and fill them from
+    /// the rim of the hole inward, one 512x512 window per piece (`--sections`).
+    sections: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -46,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
     let mut force_cpu = false;
     let mut force_gpu = false;
     let mut tile = false;
+    let mut sections = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -61,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
             "--cpu" => force_cpu = true,
             "--gpu" => force_gpu = true,
             "--tile" => tile = true,
+            "--sections" => sections = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -73,6 +79,9 @@ fn parse_args() -> Result<Args, String> {
     let output = output.ok_or("--output is required")?;
     if image.as_os_str() == "-" && mask.as_os_str() == "-" {
         return Err("--image and --mask cannot both be '-' (stdin has only one stream)".to_string());
+    }
+    if tile && sections {
+        return Err("--tile and --sections are mutually exclusive".to_string());
     }
 
     let weights = weights.unwrap_or_else(|| default_weights("big-lama.bin"));
@@ -90,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
         force_cpu,
         force_gpu,
         tile,
+        sections,
     })
 }
 
@@ -97,7 +107,7 @@ const USAGE: &str = "\
 usage: lama-inpaint --image IN.png --mask MASK.png --output OUT.png
                     [--weights big-lama.bin] [--index big-lama.json]
                     [--cpu | --gpu]
-                    [--tile]
+                    [--tile | --sections]
 
 Runs the big-lama FFC ResNet generator over IN.png, inpainting the pixels the
 mask marks (any non-black pixel is a hole), and writes OUT.png at the input
@@ -113,7 +123,19 @@ the mask and clamped inside the image.
 Only the masked pixels are taken from the network, exactly as without --tile, so
 the output is identical to cropping the window out by hand, running this binary
 on it and pasting the hole back.  Best for large images with small holes, and
-best with masks of 256x256 or less.";
+best with masks of 256x256 or less.
+
+--sections fills a mask larger than 256x256 with overlapping 256x256 sections,
+one 512x512 window per section, from the edge of the hole inward.  Each pass
+masks only its own section and writes back only its own section, so the rest of
+the hole is context on purpose: passes read the original pixels (the leak this
+mode accepts) and the earlier fills, and each pixel is re-solved by the last
+pass that covers it.
+Sections start 224px apart, so neighbours overlap by 32px.  More overlap limits
+the leak but smooths structure away; less preserves detail but reproduces more
+of a large object inside its own hole.  224 is the default.
+Sections and --tile are mutually exclusive.";
+
 /// Where the weight blob lives when `--weights` is not given.
 ///
 /// The weights are two files that travel together (`big-lama.bin` and its
@@ -223,14 +245,18 @@ fn run(args: Args) -> Result<(), String> {
     let pad_h = (PAD_MOD - height % PAD_MOD) % PAD_MOD;
     let pad_w = (PAD_MOD - width % PAD_MOD) % PAD_MOD;
 
-    if args.tile {
+    if args.sections {
         if width.min(height) <= TILE_MIN {
             log(&format!(
-                "--tile: {width}x{height} is at or below {TILE_MIN}px on its short side; running the whole image"
+                "--sections: {width}x{height} is at or below {TILE_MIN}px on its short side; running the whole image"
             ));
         } else {
-            return run_tiled(&store, &plan, &src, &mask, &args);
+            return run_sections(&store, &plan, &src, &mask, &args);
         }
+    }
+
+    if args.tile {
+        return run_tiled(&store, &plan, &src, &mask, &args);
     }
 
     let input = build_input(&src, &mask, pad_h, pad_w);
@@ -387,10 +413,311 @@ fn run_tiled(
     Ok(())
 }
 
+/// `--sections`: fill a mask larger than 256x256 in overlapping 256x256
+/// sections, one 512x512 window per section, from the rim of the hole inward.
+///
+/// Every pass runs the network at the scale the weights were trained for - a
+/// hole no larger than 256x256 inside a 512x512 frame - which is what makes the
+/// mode attractive for masks well beyond that size, and costs one inference per
+/// section.
+///
+/// Two properties make the incremental fill work:
+///
+/// * Only the pass's own section is written back, so a pixel is decided by the
+///   last pass that reaches it - the one deepest inside the hole, with all the
+///   rim already filled.  Sections overlap by `SECTION_BLOCK - SECTION_STRIDE`
+///   pixels, so the boundary between passes is re-solved rather than left as a
+///   hard grid line.
+/// * Every pass masks only its own section.  The rest of the hole is left
+///   unmasked on purpose, so the network sees the original content there and has
+///   something continuous to work from instead of a hard 512-wide hole.  That is
+///   the leak this mode accepts; the rim-inward order and the overlap are what
+///   limit its reach, because the pixels a pass leaks are re-solved by a later
+///   pass that already has fill around them.
+fn run_sections(
+    store: &weights::WeightStore,
+    plan: &model::Model,
+    src: &Rgb8,
+    mask: &Gray8,
+    args: &Args,
+) -> Result<(), String> {
+    let t_start = Instant::now();
+    let (width, height) = (src.width, src.height);
+    // Overlap is the mitigation for the leak, so it is worth being able to vary
+    // it while measuring; `LAMA_SECTION_STRIDE` is that knob.  The default is
+    // `SECTION_STRIDE`.
+    let stride = match std::env::var("LAMA_SECTION_STRIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(v) => v.clamp(1, SECTION_BLOCK),
+        None => SECTION_STRIDE,
+    };
+    let sections = section_rects(mask, stride);
+    if sections.is_empty() {
+        log("--sections: mask is empty; copying the input to the output");
+        image::write_rgb(&args.output, src)?;
+        return Ok(());
+    }
+    // The window is the same 512 `--tile` would use, so each pass is a
+    // full-context 512x512 inference.
+    let side = TILE_MIN.min(width).min(height).max(1);
+    log(&format!(
+        "sections: {} passes, {side}x{side} window each, rim inward",
+        sections.len()
+    ));
+
+    // The image the passes read and write: it starts as the original and
+    // accumulates the filled sections.
+    let mut working = Rgb8::new(width, height);
+    working.data.copy_from_slice(&src.data);
+
+    let pad = (PAD_MOD - side % PAD_MOD) % PAD_MOD;
+    let plane = (side + pad) * (side + pad);
+
+    for (i, s) in sections.iter().enumerate() {
+        let cx = (s.x0 + s.x1) / 2;
+        let cy = (s.y0 + s.y1) / 2;
+        let win = Tile {
+            x0: window_origin(cx, side, width),
+            y0: window_origin(cy, side, height),
+            side,
+            bbox_w: s.x1 - s.x0,
+            bbox_h: s.y1 - s.y0,
+        };
+        let sub_src = crop_rgb(&working, &win);
+        // Holes for this pass: the section's own pixels and nothing else.  The
+        // rest of the hole stays unmasked, so the network is handed its original
+        // content as context - the leak this mode accepts on purpose, because a
+        // 256x256 hole needs something to continue around it.  Rim-inward order
+        // (the section is surrounded by real image early on) and the overlap
+        // (every pixel is re-solved later with more fill around it) are what
+        // keep the leak from dominating.
+        let mut sub_mask = crop_gray(mask, &win);
+        for y in 0..side {
+            for x in 0..side {
+                let (gx, gy) = (win.x0 + x, win.y0 + y);
+                if gx >= s.x0 && gx < s.x1 && gy >= s.y0 && gy < s.y1 {
+                    continue;
+                }
+                sub_mask.data[y * side + x] = 0;
+            }
+        }
+
+        let input = build_input(&sub_src, &sub_mask, pad, pad);
+        let t0 = Instant::now();
+        let out = infer(store, plan, input, side + pad, side + pad, args)?;
+        log(&format!(
+            "  pass {}/{}: {side}x{side} window at ({},{}), {:.2}s",
+            i + 1,
+            sections.len(),
+            win.x0,
+            win.y0,
+            t0.elapsed().as_secs_f32()
+        ));
+
+        // Write back this section's mask pixels only.
+        for gy in s.y0..s.y1 {
+            for gx in s.x0..s.x1 {
+                if mask.data[gy * width + gx] == 0 {
+                    continue;
+                }
+                let (x, y) = (gx - win.x0, gy - win.y0);
+                let pi = y * (side + pad) + x;
+                let o = (gy * width + gx) * 3;
+                for c in 0..3 {
+                    let v = out[c * plane + pi].clamp(0.0, 1.0) * 255.0;
+                    working.data[o + c] = (v + 0.5) as u8;
+                }
+            }
+        }
+
+        // Profiling aid, in the style of LAMA_DUMP_STEP: snapshot the image as
+        // the fill progresses.
+        if let Ok(dir) = std::env::var("LAMA_DUMP_SECTIONS") {
+            let p = PathBuf::from(dir).join(format!("pass-{:02}.png", i + 1));
+            let _ = image::write_rgb(&p, &working);
+        }
+    }
+
+    image::write_rgb(&args.output, &working)?;
+    log(&format!("wrote {}", args.output.display()));
+    log(&format!("total {:.2}s", t_start.elapsed().as_secs_f32()));
+    Ok(())
+}
+
 /// The network's three stride-2 stages require multiples of 8.
 const PAD_MOD: usize = 8;
 /// Smallest window `--tile` will use, so a tiny mask still gets full context.
 const TILE_MIN: usize = 512;
+/// `--sections` fills a mask this size at a time, so every pass sees a hole no
+/// larger than the 256x256 crop the weights were trained on.
+const SECTION_BLOCK: usize = 256;
+/// How far apart successive sections start, i.e. how much they overlap:
+/// `SECTION_BLOCK - SECTION_STRIDE` pixels on each axis are re-solved by the
+/// next pass.
+///
+/// The overlap trades two failure modes against each other.  More overlap
+/// re-solves more pixels with fill already around them, which is what limits the
+/// leak of the original masked content into its own hole - on a large solid
+/// object the deepest pixels otherwise come out as the object itself.  Less
+/// overlap keeps the passes on fresh content and preserves high-frequency
+/// structure: at half a section the deck texture of a test photo was smoothed
+/// away and a rail was lost.  224 (an eighth of a section of overlap) is the
+/// point that keeps the structure the trained regime resolves while giving the
+/// least leak of the range that does.  `LAMA_SECTION_STRIDE` over-rides it for
+/// measurement.
+const SECTION_STRIDE: usize = 224;
+
+/// One rectangular piece of the mask that `--sections` fills in a single pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Section {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+/// Split the mask into overlapping `SECTION_BLOCK`-sized sections, ordered from
+/// the rim of the hole inward.
+///
+/// Sections step by `SECTION_STRIDE`, so neighbours overlap and no seam between
+/// passes is left as a hard grid line: a pixel near a boundary is written by one
+/// pass and then re-solved by the next pass that covers it, by which time the
+/// surrounding fill exists and can be continued.
+///
+/// The order comes from the mask's own depth - the distance from each masked
+/// pixel to the rim of the hole - taking the shallowest pixel of each section.
+/// The outermost sections are filled first, while the network still has the real
+/// image around the whole boundary, and the deepest ones last, by which time the
+/// fill surrounds them.  Ties break on `(y0, x0)` so the pass order is
+/// deterministic.
+fn section_rects(mask: &Gray8, stride: usize) -> Vec<Section> {
+    let (mut min_x, mut min_y) = (mask.width, mask.height);
+    let (mut max_x, mut max_y) = (0usize, 0usize);
+    let mut count = 0usize;
+    for y in 0..mask.height {
+        for x in 0..mask.width {
+            if mask.data[y * mask.width + x] > 0 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+
+    // A mask that fits in one section is the trained regime already: one pass,
+    // no reason to pay for overlaps.
+    if max_x - min_x + 1 <= SECTION_BLOCK && max_y - min_y + 1 <= SECTION_BLOCK {
+        return vec![Section { x0: min_x, y0: min_y, x1: max_x + 1, y1: max_y + 1 }];
+    }
+
+    let depth = mask_depth(mask);
+
+    let mut cells: Vec<(u32, Section)> = Vec::new();
+    let mut y0 = min_y;
+    loop {
+        let mut x0 = min_x;
+        loop {
+            let x1 = (x0 + SECTION_BLOCK).min(max_x + 1);
+            let y1 = (y0 + SECTION_BLOCK).min(max_y + 1);
+            let mut shallowest = u32::MAX;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if mask.data[y * mask.width + x] > 0 {
+                        shallowest = shallowest.min(depth[y * mask.width + x]);
+                    }
+                }
+            }
+            if shallowest != u32::MAX {
+                cells.push((shallowest, Section { x0, y0, x1, y1 }));
+            }
+            if x1 >= max_x + 1 {
+                break;
+            }
+            x0 += stride;
+        }
+        if y0 + SECTION_BLOCK >= max_y + 1 {
+            break;
+        }
+        y0 += stride;
+    }
+
+    cells.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.y0.cmp(&b.1.y0))
+            .then(a.1.x0.cmp(&b.1.x0))
+    });
+    cells.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Distance from every masked pixel to the rim of the hole, by BFS over the
+/// mask.  Pixels on the rim (touching a non-mask pixel or the image edge) are 0;
+/// unmasked pixels stay `u32::MAX`.
+fn mask_depth(mask: &Gray8) -> Vec<u32> {
+    let (w, h) = (mask.width, mask.height);
+    let mut depth = vec![u32::MAX; w * h];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if mask.data[i] == 0 {
+                continue;
+            }
+            let rim = x == 0
+                || y == 0
+                || x + 1 == w
+                || y + 1 == h
+                || mask.data[i - 1] == 0
+                || mask.data[i + 1] == 0
+                || mask.data[i - w] == 0
+                || mask.data[i + w] == 0;
+            if rim {
+                depth[i] = 0;
+                queue.push_back(i);
+            }
+        }
+    }
+    while let Some(i) = queue.pop_front() {
+        let d = depth[i];
+        let (x, y) = (i % w, i / w);
+        let mut neighbours = [usize::MAX; 4];
+        let mut n = 0;
+        if x > 0 {
+            neighbours[n] = i - 1;
+            n += 1;
+        }
+        if x + 1 < w {
+            neighbours[n] = i + 1;
+            n += 1;
+        }
+        if y > 0 {
+            neighbours[n] = i - w;
+            n += 1;
+        }
+        if y + 1 < h {
+            neighbours[n] = i + w;
+            n += 1;
+        }
+        for &j in &neighbours[..n] {
+            if mask.data[j] > 0 && depth[j] == u32::MAX {
+                depth[j] = d.saturating_add(1);
+                queue.push_back(j);
+            }
+        }
+    }
+    depth
+}
+
+/// Top-left corner of a `side`-long window centred on `c`, kept inside
+/// `[0, extent - side]`.  Saturating, so a window larger than the extent starts
+/// at 0 instead of panicking.
+fn window_origin(c: usize, side: usize, extent: usize) -> usize {
+    let max0 = extent.saturating_sub(side) as isize;
+    (c as isize - side as isize / 2).clamp(0, max0) as usize
+}
 
 /// A square window around the mask.
 struct Tile {
@@ -439,10 +766,8 @@ fn tile_rect(mask: &Gray8) -> Option<Tile> {
 
     let cx = min_x + bbox_w / 2;
     let cy = min_y + bbox_h / 2;
-    let max_x0 = mask.width.saturating_sub(side) as isize;
-    let max_y0 = mask.height.saturating_sub(side) as isize;
-    let x0 = (cx as isize - side as isize / 2).clamp(0, max_x0) as usize;
-    let y0 = (cy as isize - side as isize / 2).clamp(0, max_y0) as usize;
+    let x0 = window_origin(cx, side, mask.width);
+    let y0 = window_origin(cy, side, mask.height);
     Some(Tile { x0, y0, side, bbox_w, bbox_h })
 }
 
@@ -602,6 +927,225 @@ mod tests {
                 assert_eq!(c.data[o + 1], (y + 3) as u8);
                 assert_eq!(g.data[y * 8 + x], if y + 3 <= 21 && x + 2 <= 20 { 255 } else { 0 });
             }
+        }
+    }
+
+    /// `--sections` may cover a masked pixel several times (sections overlap),
+    /// but never zero times, and no section may be empty.
+    fn assert_covers(sections: &[Section], m: &Gray8) {
+        let mut hits = vec![0u8; m.width * m.height];
+        for s in sections {
+            let mut any = false;
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    if m.data[y * m.width + x] > 0 {
+                        hits[y * m.width + x] += 1;
+                        any = true;
+                    }
+                }
+            }
+            assert!(any, "empty section at ({},{})", s.x0, s.y0);
+            assert!(s.x1 - s.x0 <= SECTION_BLOCK && s.y1 - s.y0 <= SECTION_BLOCK);
+        }
+        for y in 0..m.height {
+            for x in 0..m.width {
+                if m.data[y * m.width + x] > 0 {
+                    assert!(hits[y * m.width + x] >= 1, "pixel ({x},{y}) in no section");
+                } else {
+                    assert_eq!(hits[y * m.width + x], 0, "pixel ({x},{y}) wrongly covered");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sections_of_a_small_mask_are_single_and_cover_it() {
+        let m = mask_of(1024, 1024, Some((500, 500, 700, 700)));
+        let s = section_rects(&m, SECTION_STRIDE);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].x0, s[0].y0, s[0].x1, s[0].y1), (500, 500, 701, 701));
+        assert_covers(&s, &m);
+    }
+
+    #[test]
+    fn a_300x300_mask_becomes_four_overlapping_sections() {
+        // A 299-wide bbox needs two starts (300 and 300 + SECTION_STRIDE) and
+        // the second is clamped to the bbox, so four sections cover it.
+        let m = mask_of(1024, 1024, Some((300, 300, 598, 598)));
+        let s = section_rects(&m, SECTION_STRIDE);
+        assert_eq!(s.len(), 4); // two starts across, two down
+        assert_covers(&s, &m);
+        let mut most = 0u8;
+        for y in 0..m.height {
+            for x in 0..m.width {
+                if m.data[y * m.width + x] > 0 {
+                    let n = s
+                        .iter()
+                        .filter(|s| x >= s.x0 && x < s.x1 && y >= s.y0 && y < s.y1)
+                        .count();
+                    most = most.max(n as u8);
+                }
+            }
+        }
+        assert!(most >= 2, "overlapping sections must cover an edge pixel twice");
+    }
+
+    #[test]
+    fn the_rim_is_filled_before_the_interior() {
+        // A 600x600 square: the first section must touch the rim of the hole and
+        // the last must sit deeper inside it.
+        let m = mask_of(2048, 2048, Some((500, 500, 1099, 1099)));
+        let s = section_rects(&m, SECTION_STRIDE);
+        assert_covers(&s, &m);
+        let depth = mask_depth(&m);
+        let section_depth = |s: &Section| {
+            let mut d = u32::MAX;
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    if m.data[y * m.width + x] > 0 {
+                        d = d.min(depth[y * m.width + x]);
+                    }
+                }
+            }
+            d
+        };
+        assert_eq!(section_depth(&s[0]), 0, "the first pass must touch the rim");
+        let last = section_depth(&s[s.len() - 1]);
+        assert!(last > 0, "the last pass must be inside the hole");
+        for pair in s.windows(2) {
+            assert!(section_depth(&pair[0]) <= section_depth(&pair[1]));
+        }
+    }
+
+    #[test]
+    fn mask_depth_is_zero_on_the_rim_and_grows_inward() {
+        let m = mask_of(512, 512, Some((100, 100, 299, 299)));
+        let d = mask_depth(&m);
+        assert_eq!(d[100 * 512 + 100], 0);
+        assert_eq!(d[299 * 512 + 299], 0);
+        assert!(d[200 * 512 + 200] >= 99, "centre must be deepest");
+        assert_eq!(d[0], u32::MAX); // outside the mask
+    }
+
+    #[test]
+    fn order_is_deterministic() {
+        let a = mask_of(2048, 2048, Some((100, 100, 699, 399)));
+        let b = mask_of(2048, 2048, Some((100, 100, 699, 399)));
+        assert_eq!(section_rects(&a, SECTION_STRIDE), section_rects(&b, SECTION_STRIDE));
+    }
+
+    #[test]
+    fn a_wide_mask_is_sectioned_and_ordered_by_depth() {
+        // A 600x300 mask: 256-blocks stepping by SECTION_STRIDE give three
+        // starts across and two rows down; every section stays inside the image
+        // and the bbox.
+        let m = mask_of(2048, 2048, Some((100, 100, 699, 399)));
+        let s = section_rects(&m, SECTION_STRIDE);
+        assert_eq!(s.len(), 6);
+        assert_covers(&s, &m);
+        let depth = mask_depth(&m);
+        let section_depth = |s: &Section| {
+            let mut d = u32::MAX;
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    if m.data[y * m.width + x] > 0 {
+                        d = d.min(depth[y * m.width + x]);
+                    }
+                }
+            }
+            d
+        };
+        for pair in s.windows(2) {
+            assert!(section_depth(&pair[0]) <= section_depth(&pair[1]));
+        }
+    }
+
+    #[test]
+    fn order_is_deterministic_when_the_mask_is_rebuilt() {
+        let a = mask_of(2048, 2048, Some((100, 100, 699, 399)));
+        let b = mask_of(2048, 2048, Some((100, 100, 699, 399)));
+        assert_eq!(section_rects(&a, SECTION_STRIDE), section_rects(&b, SECTION_STRIDE));
+        assert!(!section_rects(&a, SECTION_STRIDE).is_empty());
+    }
+
+    #[test]
+    fn empty_mask_has_no_sections() {
+        assert!(section_rects(&mask_of(256, 256, None), SECTION_STRIDE).is_empty());
+    }
+
+    #[test]
+    fn a_single_pixel_mask_is_one_small_piece() {
+        let m = mask_of(1024, 1024, Some((800, 900, 800, 900)));
+        let s = section_rects(&m, SECTION_STRIDE);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].x0, s[0].y0, s[0].x1, s[0].y1), (800, 900, 801, 901));
+        assert_covers(&s, &m);
+    }
+
+    /// The fill order must shrink the unfilled hole monotonically and finish it:
+    /// a later pass always has at least as much context as the one before, and
+    /// every masked pixel is written by some pass.
+    #[test]
+    fn passes_fill_the_hole_monotonically_and_completely() {
+        let (w, h) = (1024usize, 1024usize);
+        let m = mask_of(w, h, Some((300, 300, 598, 598)));
+        let sections = section_rects(&m, SECTION_STRIDE);
+        let total = m.data.iter().filter(|&&v| v > 0).count();
+        assert!(total > 0);
+
+        // Mirror of the loop in run_sections: each pass writes its own section's
+        // masked pixels and the unfilled set never grows.
+        let mut filled = vec![false; w * h];
+        let mut remaining = total;
+        let mut seen = Vec::new();
+        for s in &sections {
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    let i = y * w + x;
+                    if m.data[i] > 0 && !filled[i] {
+                        filled[i] = true;
+                        remaining -= 1;
+                    }
+                }
+            }
+            seen.push(remaining);
+        }
+        assert_eq!(remaining, 0, "every masked pixel must be filled");
+        assert!(seen[0] < total, "the first pass must make progress");
+        for pair in seen.windows(2) {
+            assert!(pair[1] <= pair[0], "the unfilled hole must only shrink");
+        }
+        // Rim-inward means the first pass touches the boundary of the hole.
+        let depth = mask_depth(&m);
+        let first = &sections[0];
+        let touches_rim = (first.y0..first.y1).any(|y| {
+            (first.x0..first.x1).any(|x| m.data[y * w + x] > 0 && depth[y * w + x] == 0)
+        });
+        assert!(touches_rim, "the first pass must start at the rim");
+    }
+
+    #[test]
+    fn window_origin_stays_inside() {
+        assert_eq!(window_origin(0, 512, 1024), 0);
+        assert_eq!(window_origin(1023, 512, 1024), 512);
+        assert_eq!(window_origin(500, 512, 1024), 244);
+        // A window at least as large as the extent starts at 0.
+        assert_eq!(window_origin(600, 512, 300), 0);
+        assert_eq!(window_origin(0, 4096, 1024), 0);
+    }
+
+    #[test]
+    fn every_section_fits_in_a_512_window_inside_a_large_image() {
+        // The mode relies on this: whatever the section, a 512 window clamped
+        // inside an image whose short side exceeds 512 contains it.
+        let m = mask_of(1024, 1024, Some((0, 0, 1023, 1023)));
+        for s in section_rects(&m, SECTION_STRIDE) {
+            let cx = (s.x0 + s.x1) / 2;
+            let cy = (s.y0 + s.y1) / 2;
+            let x0 = window_origin(cx, TILE_MIN, 1024);
+            let y0 = window_origin(cy, TILE_MIN, 1024);
+            assert!(x0 <= s.x0 && s.x1 <= x0 + TILE_MIN, "section {s:?} clipped in x");
+            assert!(y0 <= s.y0 && s.y1 <= y0 + TILE_MIN, "section {s:?} clipped in y");
         }
     }
 }
