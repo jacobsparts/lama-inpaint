@@ -19,11 +19,25 @@ Two independent backends live in `lama-rs/`:
 | CUDA | `src/cuda.rs` | cuBLAS SGEMM over im2col patches, cuFFT for the Fourier units, custom kernels for the rest; 0.4 s for 512x512 on a GTX 1080 |
 | CPU | `src/cpu.rs` | direct convolution, rayon-parallel; authoritative for semantics - every GPU change is diffed against it (max 1/255, commonly 0) |
 
+The binary runs the generator in **three operating modes**:
+
+* **Plain** — the default. Runs the generator across the whole image. Best for small
+  holes; wastes work on large images with tiny masks and fails inside large ones.
+* **`--tile`** — crops a square window around the mask, runs the generator on that,
+  and pastes the result back. For large images with a **small** hole.
+* **`--sections`** — fills a large mask in discrete 256x256 pieces, one 512x512 window
+  per piece, from the rim of the hole inward. For images with a **large** hole.
+
+`--tile` and `--sections` are novel enhancements added by this project: they are
+not part of the original LaMa algorithm or the PyTorch reference. Both modes
+preserve the same strict contract as plain — only masked pixels are taken from the
+network — so the mode you choose changes only the geometry of the forward pass.
+
 ## Quick start (release binary)
 
 Download the binary and the two weight files from the
-[latest release](https://github.com/jacobsparts/lama-inpaint/releases/latest) into one
-directory and run:
+[latest release](https://github.com/jacobsparts/lama-inpaint/releases/latest)
+into one directory and run:
 
 ```
 ./lama-inpaint --image photo.png --mask mask.png --output out.png
@@ -286,5 +300,6 @@ step loop, download, totals). Finer instruments: `LAMA_PROFILE_OPS`,
 
 The model architecture and the `big-lama` weights come from the
 [saicinpainting](https://github.com/advimman/lama) project (Apache-2.0);
-`big-lama.bin` is a repacking of that checkpoint, not a new model. The code in
-this repository is Apache-2.0 - see `LICENSE`.
+`big-lama.bin` is a repacking of that checkpoint, not a new model. `--tile`
+and `--sections` are additions of this project and are not part of the original
+algorithm. The code in this repository is Apache-2.0 - see `LICENSE`.
